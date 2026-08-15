@@ -51,7 +51,7 @@ Upstream source: https://github.com/grafana/grafana
 
 ## Automation
 
-`.github/workflows/mirror.yml` checks the upstream stable release every six hours and can also be started manually. For a new version, a 15-entry job matrix downloads, verifies, and uploads every official package independently and in parallel; source and provenance files are prepared alongside it. A final job publishes the draft only after all 20 release assets and their server-computed SHA-256 digests match. A push that changes the workflow or release-preparation script triggers the same check. The workflow uses only the repository-scoped ephemeral `GITHUB_TOKEN`; no personal access token or long-lived secret is required.
+`.github/workflows/mirror.yml` checks the upstream stable release every hour and can also be started manually. For a new version, a 15-entry job matrix downloads, verifies, and uploads every official package independently and in parallel; source and provenance files are prepared alongside it. A final job publishes the draft only after all 20 release assets and their server-computed SHA-256 digests match. A push that changes the workflow or release-preparation script triggers the same check. The workflow uses only the repository-scoped ephemeral `GITHUB_TOKEN`; no personal access token or long-lived secret is required.
 
 GitHub automatically disables scheduled workflows in a public repository after 60 days without repository activity. To prevent this mirror from silently stopping during a long period without upstream releases, the workflow performs one small weekly heartbeat commit to `.mirror/heartbeat.txt`. The heartbeat path is intentionally excluded from the `push` trigger, so that commit does not recursively start another mirror run.
 

@@ -8,7 +8,7 @@ on:
       - ".github/workflows/mirror.yml"
       - "scripts/prepare_release.py"
   schedule:
-    - cron: "17 */6 * * *"
+    - cron: "17 * * * *"
     - cron: "41 3 * * 0"
   workflow_dispatch:
 
