@@ -1,0 +1,146 @@
+name: Mirror Grafana OSS
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/mirror.yml"
+      - "scripts/prepare_release.py"
+  schedule:
+    - cron: "17 */6 * * *"
+    - cron: "41 3 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: grafana-oss-release-mirror
+  cancel-in-progress: false
+
+jobs:
+  heartbeat:
+    if: github.event_name == 'schedule' && github.event.schedule == '41 3 * * 0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out mirror automation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Keep public-repository schedules active
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .mirror
+          date -u +%Y-%m-%dT%H:%M:%SZ > .mirror/heartbeat.txt
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .mirror/heartbeat.txt
+          git commit -m "chore: keep scheduled mirror active"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+
+    steps:
+      - name: Check out mirror automation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Determine current stable Grafana OSS release
+        id: identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/prepare_release.py \
+            --metadata-only \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Check whether release already exists
+        id: existing
+        shell: bash
+        env:
+          TAG: ${{ steps.identity.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if draft="$(gh release view "$TAG" --json isDraft --jq '.isDraft' 2>/dev/null)"; then
+            if [[ "$draft" == "false" ]]; then
+              echo "Published release $TAG already exists; nothing to do."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            echo "Removing stale draft release $TAG before rebuilding it."
+            gh release delete "$TAG" --yes --cleanup-tag
+          fi
+
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Download and verify release payload
+        if: steps.existing.outputs.skip != 'true'
+        id: prepared
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf dist
+          python3 scripts/prepare_release.py \
+            --output-dir dist \
+            --github-output "$RUNNER_TEMP/prepared-output"
+
+          prepared_version="$(sed -n 's/^version=//p' "$RUNNER_TEMP/prepared-output")"
+          prepared_tag="$(sed -n 's/^tag=//p' "$RUNNER_TEMP/prepared-output")"
+
+          if [[ "$prepared_version" != "${{ steps.identity.outputs.version }}" ]] || \
+             [[ "$prepared_tag" != "${{ steps.identity.outputs.tag }}" ]]; then
+            echo "Stable release changed during this run; refusing to publish mixed metadata/assets." >&2
+            exit 1
+          fi
+
+          echo "version=$prepared_version" >> "$GITHUB_OUTPUT"
+          echo "tag=$prepared_tag" >> "$GITHUB_OUTPUT"
+
+      - name: Publish verified GitHub Release
+        if: steps.existing.outputs.skip != 'true'
+        shell: bash
+        env:
+          TAG: ${{ steps.prepared.outputs.tag }}
+          VERSION: ${{ steps.prepared.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          release_created=false
+          cleanup() {
+            status=$?
+            if [[ $status -ne 0 && "$release_created" == "true" ]]; then
+              echo "Publishing failed; deleting incomplete draft $TAG." >&2
+              gh release delete "$TAG" --yes --cleanup-tag || true
+            fi
+            exit "$status"
+          }
+          trap cleanup EXIT
+
+          gh release create "$TAG" \
+            --draft \
+            --target "$GITHUB_SHA" \
+            --title "Grafana OSS $VERSION — unofficial mirror" \
+            --notes-file dist/RELEASE-NOTES.md
+          release_created=true
+
+          gh release upload "$TAG" \
+            dist/*.deb \
+            dist/*-source.tar.gz \
+            dist/*-LICENSE.txt \
+            dist/upstream-metadata.json \
+            dist/UPSTREAM-SHA256SUMS \
+            dist/MIRROR-SHA256SUMS
+
+          gh release edit "$TAG" --draft=false --latest
+          release_created=false
+          trap - EXIT

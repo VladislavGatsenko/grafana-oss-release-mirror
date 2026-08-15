@@ -1,0 +1,5 @@
+.worktrees/
+dist/
+dist-live/
+__pycache__/
+*.pyc
