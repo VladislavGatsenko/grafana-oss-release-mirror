@@ -21,7 +21,7 @@ VALID = {
             "version": "13.1.3",
             "arch": "amd64",
             "os": "deb",
-            "url": "https://dl.grafana.com/grafana/release/13.1.3/grafana_13.1.3_build_linux_amd64.deb",
+            "url": "https://dl.grafana.com/grafana/release/13.1.3/grafana_13.1.3_31135815010_linux_amd64.deb",
             "sha256": "a" * 64,
             "license": "agplv3",
         },
@@ -30,7 +30,7 @@ VALID = {
             "version": "13.1.3",
             "arch": "arm64",
             "os": "deb",
-            "url": "https://dl.grafana.com/grafana/release/13.1.3/grafana_13.1.3_build_linux_arm64.deb",
+            "url": "https://dl.grafana.com/grafana/release/13.1.3/grafana_13.1.3_31135815010_linux_arm64.deb",
             "sha256": "b" * 64,
             "license": "agplv3",
         },
@@ -129,6 +129,28 @@ class ValidateReleaseTests(unittest.TestCase):
                 "url", m["packages"][0]["url"].replace("/13.1.3/", "/13.1.2/")
             ),
             "URL",
+        )
+
+    def test_rejects_nested_release_path(self):
+        self.assert_rejected(
+            lambda m: m["packages"][0].__setitem__(
+                "url", m["packages"][0]["url"].replace("/grafana_13.1.3", "/nested/grafana_13.1.3")
+            ),
+            "URL",
+        )
+
+    def test_rejects_filename_architecture_mismatch(self):
+        self.assert_rejected(
+            lambda m: m["packages"][0].__setitem__(
+                "url", m["packages"][0]["url"].replace("_amd64.deb", "_arm64.deb")
+            ),
+            "URL",
+        )
+
+    def test_rejects_colliding_package_filenames(self):
+        self.assert_rejected(
+            lambda m: m["packages"][1].__setitem__("url", m["packages"][0]["url"]),
+            "filename",
         )
 
     def test_rejects_non_deb_url(self):
@@ -299,6 +321,73 @@ class PrepareReleaseTests(unittest.TestCase):
             self.assertIn("output directory", str(ctx.exception))
 
 
+class VerifyUploadedAssetsTests(unittest.TestCase):
+    ASSET_NAMES = (
+        "grafana_13.1.3_31135815010_linux_amd64.deb",
+        "grafana_13.1.3_31135815010_linux_arm64.deb",
+        "grafana-13.1.3-source.tar.gz",
+        "grafana-13.1.3-LICENSE.txt",
+        "upstream-metadata.json",
+        "UPSTREAM-SHA256SUMS",
+        "MIRROR-SHA256SUMS",
+    )
+
+    def make_fixture(self, root: Path):
+        dist = root / "dist"
+        dist.mkdir()
+        for index, name in enumerate(self.ASSET_NAMES):
+            (dist / name).write_bytes(f"asset-{index}\n".encode())
+        (dist / "RELEASE-NOTES.md").write_text("notes\n")
+        payload = {
+            "isDraft": True,
+            "assets": [
+                {
+                    "name": path.name,
+                    "size": path.stat().st_size,
+                    "digest": f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}",
+                    "state": "uploaded",
+                }
+                for path in sorted(dist.iterdir())
+                if path.name != "RELEASE-NOTES.md"
+            ],
+        }
+        release_json = root / "release.json"
+        release_json.write_text(json.dumps(payload))
+        return dist, release_json, payload
+
+    def assert_rejected_payload(self, mutator, pattern):
+        with tempfile.TemporaryDirectory() as tmp:
+            dist, release_json, payload = self.make_fixture(Path(tmp))
+            mutator(payload)
+            release_json.write_text(json.dumps(payload))
+            with self.assertRaises(MirrorError) as ctx:
+                pr.verify_uploaded_assets(dist, release_json)
+            self.assertIn(pattern, str(ctx.exception))
+
+    def test_accepts_exact_uploaded_draft_asset_set(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dist, release_json, _ = self.make_fixture(Path(tmp))
+            pr.verify_uploaded_assets(dist, release_json)
+
+    def test_rejects_release_that_is_no_longer_a_draft(self):
+        self.assert_rejected_payload(lambda p: p.__setitem__("isDraft", False), "draft")
+
+    def test_rejects_missing_remote_asset(self):
+        self.assert_rejected_payload(lambda p: p["assets"].pop(), "set")
+
+    def test_rejects_duplicate_remote_asset_name(self):
+        self.assert_rejected_payload(lambda p: p["assets"].append(copy.deepcopy(p["assets"][0])), "duplicate")
+
+    def test_rejects_remote_asset_size_mismatch(self):
+        self.assert_rejected_payload(lambda p: p["assets"][0].__setitem__("size", 0), "size")
+
+    def test_rejects_remote_asset_digest_mismatch(self):
+        self.assert_rejected_payload(lambda p: p["assets"][0].__setitem__("digest", "sha256:" + "0" * 64), "digest")
+
+    def test_rejects_remote_asset_that_is_not_uploaded(self):
+        self.assert_rejected_payload(lambda p: p["assets"][0].__setitem__("state", "new"), "state")
+
+
 class CliTests(unittest.TestCase):
     def test_metadata_only_writes_version_and_tag_without_downloading_assets(self):
         raw = json.dumps(VALID).encode() + b"\n"
@@ -365,6 +454,8 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertIn("gh release create", workflow)
         self.assertIn("--draft", workflow)
         self.assertIn("gh release upload", workflow)
+        self.assertIn("--json isDraft,assets", workflow)
+        self.assertIn("--verify-uploaded-assets", workflow)
         self.assertIn("gh release edit", workflow)
         self.assertIn("--draft=false", workflow)
         self.assertIn("gh release delete", workflow)
@@ -380,6 +471,14 @@ class RepositoryContractTests(unittest.TestCase):
                 "uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1",
             ],
         )
+        self.assertLess(workflow.index("--verify-uploaded-assets"), workflow.index("gh release edit"))
+
+    def test_workflow_cleanup_deletes_only_a_confirmed_draft(self):
+        workflow = Path(".github/workflows/mirror.yml").read_text()
+        cleanup = workflow.split("cleanup() {", 1)[1].split("          }", 1)[0]
+        self.assertIn('gh release view "$TAG" --json isDraft', cleanup)
+        self.assertIn('[[ "$draft" == "true" ]]', cleanup)
+        self.assertLess(cleanup.index("gh release view"), cleanup.index("gh release delete"))
 
     def test_readme_documents_integrity_source_license_and_unofficial_status(self):
         readme = Path("README.md").read_text()

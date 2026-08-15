@@ -209,7 +209,7 @@ Expected: workflow contract test fails because workflow file does not exist.
 
 - [ ] **Step 3: Implement workflow**
 
-The mirror job first calls the preparation script with a metadata-only mode to obtain `version/tag` without large downloads. A separate heartbeat job runs only for the weekly heartbeat cron, commits `.mirror/heartbeat.txt`, and pushes it with the repository `GITHUB_TOKEN`; the push trigger excludes that path. It checks `gh release view "$TAG" --json isDraft`; published release exits zero, stale draft is deleted. It then runs full preparation, creates a draft release using `RELEASE-NOTES.md`, uploads `dist/*` except release notes, publishes with `gh release edit --draft=false --latest`, and traps failures to delete an incomplete draft.
+The mirror job first calls the preparation script with a metadata-only mode to obtain `version/tag` without large downloads. A separate heartbeat job runs only for the weekly heartbeat cron, commits `.mirror/heartbeat.txt`, and pushes it with the repository `GITHUB_TOKEN`; the push trigger excludes that path. It checks `gh release view "$TAG" --json isDraft`; published release exits zero, stale draft is deleted. It then runs full preparation, creates a draft release using `RELEASE-NOTES.md`, uploads `dist/*` except release notes, verifies GitHub's exact draft asset names, sizes, uploaded states, and SHA-256 digests, publishes with `gh release edit --draft=false --latest`, and traps failures to delete only an incomplete release confirmed to remain a draft.
 
 Use:
 

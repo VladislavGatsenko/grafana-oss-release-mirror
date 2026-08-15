@@ -119,8 +119,16 @@ jobs:
           cleanup() {
             status=$?
             if [[ $status -ne 0 && "$release_created" == "true" ]]; then
-              echo "Publishing failed; deleting incomplete draft $TAG." >&2
-              gh release delete "$TAG" --yes --cleanup-tag || true
+              if draft="$(gh release view "$TAG" --json isDraft --jq '.isDraft' 2>/dev/null)"; then
+                if [[ "$draft" == "true" ]]; then
+                  echo "Publishing failed; deleting incomplete draft $TAG." >&2
+                  gh release delete "$TAG" --yes --cleanup-tag || true
+                else
+                  echo "Release $TAG is published; preserving it despite the local command failure." >&2
+                fi
+              else
+                echo "Cannot confirm that $TAG is still a draft; preserving it." >&2
+              fi
             fi
             exit "$status"
           }
@@ -140,6 +148,11 @@ jobs:
             dist/upstream-metadata.json \
             dist/UPSTREAM-SHA256SUMS \
             dist/MIRROR-SHA256SUMS
+
+          gh release view "$TAG" --json isDraft,assets > "$RUNNER_TEMP/release-assets.json"
+          python3 scripts/prepare_release.py \
+            --output-dir dist \
+            --verify-uploaded-assets "$RUNNER_TEMP/release-assets.json"
 
           gh release edit "$TAG" --draft=false --latest
           release_created=false

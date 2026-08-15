@@ -22,7 +22,7 @@ The Grafana binary packages are not modified, renamed, recompressed, or repackag
 
 The automation treats the Grafana stable release API as the source of truth and fails closed unless the release and both selected packages declare `agplv3`, the release is stable only, package versions match, package URLs are on the expected Grafana release path, and exactly one Debian package exists for each required architecture.
 
-Before a release is created, every mirrored `.deb` is downloaded and verified against the upstream SHA-256 value. If any checksum or policy check fails, no public release is published.
+Before a release is created, every mirrored `.deb` is downloaded and verified against the upstream SHA-256 value. After upload to a draft Release, the automation also requires GitHub's asset names, sizes, upload states, and server-computed SHA-256 digests to match the complete local payload before publication. If any policy, checksum, upload, or asset-set check fails, no public release is published.
 
 After downloading a release, verify the upstream binary checksums with:
 

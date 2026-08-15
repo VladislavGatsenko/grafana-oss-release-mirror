@@ -63,8 +63,12 @@ def _validate_package(package: dict, version: str) -> None:
         "package URL is outside the allowed Grafana release location",
     )
     filename = PurePosixPath(parsed.path).name
+    _require(parsed.path == expected_prefix + filename, "package URL must use the direct Grafana release path")
     _require(filename.endswith(".deb"), "package URL must end in .deb")
-    _require(filename not in {"", ".", ".."}, "package URL has an invalid filename")
+    expected_filename = re.compile(
+        rf"^grafana_{re.escape(version)}_[0-9]+_linux_{re.escape(package['arch'])}\.deb$"
+    )
+    _require(expected_filename.fullmatch(filename) is not None, "package URL filename does not match version/architecture")
 
     sha256 = package.get("sha256")
     _require(isinstance(sha256, str) and SHA256_RE.fullmatch(sha256) is not None, "package SHA-256 is invalid")
@@ -93,6 +97,9 @@ def validate_release(metadata: dict) -> tuple[str, list[dict]]:
         _require(len(matches) == 1, f"expected exactly one deb package for {arch}, found {len(matches)}")
         _validate_package(matches[0], version)
         selected.append(matches[0])
+
+    filenames = [PurePosixPath(urlparse(package["url"]).path).name for package in selected]
+    _require(len(set(filenames)) == len(filenames), "package filenames must be distinct")
 
     return version, selected
 
@@ -127,6 +134,43 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: src.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def verify_uploaded_assets(output_dir: Path, release_json_path: Path) -> None:
+    output_dir = Path(output_dir)
+    _require(output_dir.is_dir(), "release asset directory is missing")
+    try:
+        release = json.loads(Path(release_json_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise MirrorError(f"release asset metadata is invalid: {exc}") from exc
+
+    _require(isinstance(release, dict), "release asset metadata must be an object")
+    _require(release.get("isDraft") is True, "release must remain a draft during asset verification")
+    remote_assets = release.get("assets")
+    _require(isinstance(remote_assets, list), "release assets must be a list")
+
+    local_assets = sorted(
+        (path for path in output_dir.iterdir() if path.is_file() and path.name != "RELEASE-NOTES.md"),
+        key=lambda path: path.name,
+    )
+    _require(len(local_assets) == 7, f"expected exactly 7 local release assets, found {len(local_assets)}")
+
+    remote_by_name: dict[str, dict] = {}
+    for asset in remote_assets:
+        _require(isinstance(asset, dict), "release asset entry must be an object")
+        name = asset.get("name")
+        _require(isinstance(name, str) and name, "release asset name is invalid")
+        _require(name not in remote_by_name, f"duplicate release asset name: {name}")
+        remote_by_name[name] = asset
+
+    local_names = {path.name for path in local_assets}
+    _require(set(remote_by_name) == local_names, "uploaded release asset set does not match local verified assets")
+    for path in local_assets:
+        asset = remote_by_name[path.name]
+        _require(asset.get("state") == "uploaded", f"release asset state is not uploaded: {path.name}")
+        _require(asset.get("size") == path.stat().st_size, f"release asset size mismatch: {path.name}")
+        expected_digest = f"sha256:{sha256_file(path)}"
+        _require(asset.get("digest") == expected_digest, f"release asset digest mismatch: {path.name}")
 
 
 def _metadata_from_bytes(raw: bytes) -> dict:
@@ -244,9 +288,16 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Prepare a verified Grafana OSS GitHub Release mirror payload")
     parser.add_argument("--output-dir", type=Path, default=Path("dist"))
     parser.add_argument("--metadata-url", default=STABLE_METADATA_URL)
-    parser.add_argument("--metadata-only", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--metadata-only", action="store_true")
+    mode.add_argument("--verify-uploaded-assets", type=Path, metavar="RELEASE_JSON")
     parser.add_argument("--github-output", type=Path)
     args = parser.parse_args(argv)
+
+    if args.verify_uploaded_assets:
+        verify_uploaded_assets(args.output_dir, args.verify_uploaded_assets)
+        print("Verified uploaded draft release assets")
+        return 0
 
     if args.metadata_only:
         version, tag = get_release_identity(args.metadata_url)

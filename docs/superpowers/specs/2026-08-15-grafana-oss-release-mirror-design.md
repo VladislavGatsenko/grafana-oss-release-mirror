@@ -81,7 +81,7 @@ Release title: `Grafana OSS {version} — unofficial mirror`
 
 Before downloads, the workflow queries GitHub for that tag. If a non-draft release already exists, the job exits successfully without changing it. If a stale draft exists, it is deleted and rebuilt from scratch.
 
-The release is created as a draft only after all assets have been downloaded and verified. It is published only after every upload succeeds. A failed run therefore cannot expose a partial public release.
+The release is created as a draft only after all assets have been downloaded and verified. It is published only after every upload succeeds and GitHub reports the exact expected asset names, sizes, uploaded states, and SHA-256 digests. A failed run therefore cannot expose a partial public release.
 
 ## Integrity and provenance
 
@@ -141,9 +141,10 @@ Orchestration layer. It:
 3. calls `prepare_release.py` only when necessary;
 4. creates a draft release;
 5. uploads all verified assets;
-6. publishes the release;
-7. cleans up a draft on failure where possible;
-8. performs a weekly heartbeat commit to prevent GitHub from disabling scheduled runs after repository inactivity.
+6. verifies the complete draft asset set against local names, sizes, and SHA-256 digests;
+7. publishes the release;
+8. cleans up only a release confirmed to remain a draft on failure;
+9. performs a weekly heartbeat commit to prevent GitHub from disabling scheduled runs after repository inactivity.
 
 ### `tests/test_prepare_release.py`
 
