@@ -1,28 +1,31 @@
 # Grafana OSS Release Mirror
 
-This repository is an independent, **unofficial** release mirror for unmodified **Grafana® OSS** Debian/Ubuntu packages. It exists to provide an alternate download location when Grafana's primary download infrastructure is difficult or unreliable to reach.
+This repository is an independent, **unofficial** release mirror for unmodified **Grafana® OSS** packages. It exists to provide an alternate download location when Grafana's primary download infrastructure is difficult or unreliable to reach.
 
-The mirror intentionally has a narrow scope: only stable Grafana OSS `.deb` packages for `amd64` and `arm64` are published. Enterprise packages, beta/preview/nightly builds, RPMs, Windows/macOS packages, containers, and plugins are not mirrored.
+The mirror publishes every stable package marked `agplv3` by the Grafana release API. Enterprise packages, beta/preview/nightly builds, containers, and plugins are not mirrored.
 
 ## What each release contains
 
 Each GitHub Release contains:
 
-- the original upstream Debian/Ubuntu `amd64` `.deb`;
-- the original upstream Debian/Ubuntu `arm64` `.deb`;
+- macOS tarballs for `amd64` and `arm64`;
+- Debian packages for `amd64`, `arm64`, `armv6`, and `armv7`;
+- Linux tarballs for `amd64`, `arm64`, `armv6`, and `armv7`;
+- RPM packages for `amd64` and `arm64`;
+- Windows tarballs for `amd64` and `arm64`, plus the `amd64` MSI installer;
 - corresponding source for the exact upstream `v<version>` tag;
 - the matching upstream Grafana license text;
 - `upstream-metadata.json`, preserved exactly as received from the Grafana stable release API;
-- `UPSTREAM-SHA256SUMS`, containing the SHA-256 values published by Grafana for the two binary packages;
+- `UPSTREAM-SHA256SUMS`, containing the SHA-256 values published by Grafana for every mirrored package;
 - `MIRROR-SHA256SUMS`, containing locally calculated SHA-256 values for the release assets.
 
 The Grafana binary packages are not modified, renamed, recompressed, or repackaged.
 
 ## Integrity model
 
-The automation treats the Grafana stable release API as the source of truth and fails closed unless the release and both selected packages declare `agplv3`, the release is stable only, package versions match, package URLs are on the expected Grafana release path, and exactly one Debian package exists for each required architecture.
+The automation treats the Grafana stable release API as the source of truth and fails closed unless the release and all 15 expected packages declare `agplv3`, the release is stable only, package versions match, package URLs and filenames match their platforms, and exactly one package exists for every required OS/architecture pair.
 
-Before a release is created, every mirrored `.deb` is downloaded and verified against the upstream SHA-256 value. After upload to a draft Release, the automation also requires GitHub's asset names, sizes, upload states, and server-computed SHA-256 digests to match the complete local payload before publication. If any policy, checksum, upload, or asset-set check fails, no public release is published.
+Before a release is published, every mirrored package is downloaded and verified against the upstream SHA-256 value. After upload to a draft Release, the automation also requires GitHub's asset names, upload states, and server-computed SHA-256 digests to match the complete payload. If any policy, checksum, upload, or asset-set check fails, no public release is published.
 
 After downloading a release, verify the upstream binary checksums with:
 
@@ -48,7 +51,7 @@ Upstream source: https://github.com/grafana/grafana
 
 ## Automation
 
-`.github/workflows/mirror.yml` checks the upstream stable release every six hours and can also be started manually. A push that changes the workflow or release-preparation script triggers the same check, which makes initial deployment and future automation updates self-testing. It uses only the repository-scoped ephemeral `GITHUB_TOKEN`; no personal access token or long-lived secret is required.
+`.github/workflows/mirror.yml` checks the upstream stable release every six hours and can also be started manually. For a new version, a 15-entry job matrix downloads, verifies, and uploads every official package independently and in parallel; source and provenance files are prepared alongside it. A final job publishes the draft only after all 20 release assets and their server-computed SHA-256 digests match. A push that changes the workflow or release-preparation script triggers the same check. The workflow uses only the repository-scoped ephemeral `GITHUB_TOKEN`; no personal access token or long-lived secret is required.
 
 GitHub automatically disables scheduled workflows in a public repository after 60 days without repository activity. To prevent this mirror from silently stopping during a long period without upstream releases, the workflow performs one small weekly heartbeat commit to `.mirror/heartbeat.txt`. The heartbeat path is intentionally excluded from the `push` trigger, so that commit does not recursively start another mirror run.
 

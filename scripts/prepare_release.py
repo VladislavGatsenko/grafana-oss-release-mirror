@@ -7,11 +7,35 @@ import json
 import re
 import shutil
 import urllib.request
-from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlparse
 
-REQUIRED_ARCHES = ("amd64", "arm64")
+REQUIRED_PACKAGES = (
+    ("darwin", "amd64"),
+    ("darwin", "arm64"),
+    ("deb", "amd64"),
+    ("deb", "arm64"),
+    ("deb", "armv6"),
+    ("deb", "armv7"),
+    ("linux", "amd64"),
+    ("linux", "arm64"),
+    ("linux", "armv6"),
+    ("linux", "armv7"),
+    ("rhel", "amd64"),
+    ("rhel", "arm64"),
+    ("win", "amd64"),
+    ("win", "arm64"),
+    ("win-installer", "amd64"),
+)
+PACKAGE_EXTENSIONS = {
+    "darwin": ".tar.gz",
+    "deb": ".deb",
+    "linux": ".tar.gz",
+    "rhel": ".rpm",
+    "win": ".tar.gz",
+    "win-installer": ".msi",
+}
+EXPECTED_RELEASE_ASSET_COUNT = len(REQUIRED_PACKAGES) + 5
 VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
 SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 
@@ -30,25 +54,17 @@ class MirrorError(RuntimeError):
     pass
 
 
-@dataclass(frozen=True)
-class ReleaseInfo:
-    version: str
-    tag: str
-    assets: tuple[Path, ...]
-    notes_path: Path
-
-
 def _require(condition: bool, message: str) -> None:
     if not condition:
         raise MirrorError(message)
 
 
-def _validate_package(package: dict, version: str) -> None:
+def _validate_package(package: dict, version: str, package_os: str, arch: str) -> None:
     _require(package.get("product") == "grafana", "package product must be grafana")
     _require(package.get("version") == version, "package version must match release version")
     _require(package.get("license") == "agplv3", "package license must be agplv3")
-    _require(package.get("os") == "deb", "selected package OS must be deb")
-    _require(package.get("arch") in REQUIRED_ARCHES, "selected package architecture is not allowed")
+    _require(package.get("os") == package_os, f"package OS must be {package_os}")
+    _require(package.get("arch") == arch, f"package architecture must be {arch}")
 
     url = package.get("url")
     _require(isinstance(url, str) and url, "package URL is missing")
@@ -64,11 +80,17 @@ def _validate_package(package: dict, version: str) -> None:
     )
     filename = PurePosixPath(parsed.path).name
     _require(parsed.path == expected_prefix + filename, "package URL must use the direct Grafana release path")
-    _require(filename.endswith(".deb"), "package URL must end in .deb")
+    prefix = "grafana-rpi" if (package_os, arch) == ("deb", "armv6") else "grafana"
+    platform = "darwin" if package_os == "darwin" else "windows" if package_os.startswith("win") else "linux"
+    filename_arch = {"armv6": "arm-6", "armv7": "arm-7"}.get(arch, arch)
+    extension = PACKAGE_EXTENSIONS[package_os]
     expected_filename = re.compile(
-        rf"^grafana_{re.escape(version)}_[0-9]+_linux_{re.escape(package['arch'])}\.deb$"
+        rf"^{re.escape(prefix)}_{re.escape(version)}_[0-9]+_{platform}_{filename_arch}{re.escape(extension)}$"
     )
-    _require(expected_filename.fullmatch(filename) is not None, "package URL filename does not match version/architecture")
+    _require(
+        expected_filename.fullmatch(filename) is not None,
+        f"package URL filename does not match {package_os}/{arch}",
+    )
 
     sha256 = package.get("sha256")
     _require(isinstance(sha256, str) and SHA256_RE.fullmatch(sha256) is not None, "package SHA-256 is invalid")
@@ -90,12 +112,20 @@ def validate_release(metadata: dict) -> tuple[str, list[dict]]:
 
     packages = metadata.get("packages")
     _require(isinstance(packages, list), "release packages must be a list")
+    _require(
+        len(packages) == len(REQUIRED_PACKAGES),
+        f"expected exactly {len(REQUIRED_PACKAGES)} stable OSS packages, found {len(packages)}",
+    )
+    _require(all(isinstance(package, dict) for package in packages), "every package entry must be an object")
 
     selected: list[dict] = []
-    for arch in REQUIRED_ARCHES:
-        matches = [p for p in packages if isinstance(p, dict) and p.get("os") == "deb" and p.get("arch") == arch]
-        _require(len(matches) == 1, f"expected exactly one deb package for {arch}, found {len(matches)}")
-        _validate_package(matches[0], version)
+    for package_os, arch in REQUIRED_PACKAGES:
+        matches = [package for package in packages if package.get("os") == package_os and package.get("arch") == arch]
+        _require(
+            len(matches) == 1,
+            f"expected exactly one {package_os}/{arch} package, found {len(matches)}",
+        )
+        _validate_package(matches[0], version, package_os, arch)
         selected.append(matches[0])
 
     filenames = [PurePosixPath(urlparse(package["url"]).path).name for package in selected]
@@ -136,9 +166,7 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def verify_uploaded_assets(output_dir: Path, release_json_path: Path) -> None:
-    output_dir = Path(output_dir)
-    _require(output_dir.is_dir(), "release asset directory is missing")
+def verify_uploaded_assets(release_json_path: Path, mirror_manifest_path: Path) -> None:
     try:
         release = json.loads(Path(release_json_path).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -149,11 +177,28 @@ def verify_uploaded_assets(output_dir: Path, release_json_path: Path) -> None:
     remote_assets = release.get("assets")
     _require(isinstance(remote_assets, list), "release assets must be a list")
 
-    local_assets = sorted(
-        (path for path in output_dir.iterdir() if path.is_file() and path.name != "RELEASE-NOTES.md"),
-        key=lambda path: path.name,
+    manifest_path = Path(mirror_manifest_path)
+    try:
+        manifest_lines = manifest_path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise MirrorError(f"mirror checksum manifest is invalid: {exc}") from exc
+
+    expected: dict[str, str] = {}
+    for line in manifest_lines:
+        parts = line.split("  ", 1)
+        _require(len(parts) == 2, "mirror checksum manifest line is invalid")
+        digest, name = parts
+        _require(SHA256_RE.fullmatch(digest) is not None, f"mirror checksum is invalid: {name}")
+        _require(PurePosixPath(name).name == name and name not in {"", ".", ".."}, "mirror asset name is invalid")
+        _require(name not in expected, f"duplicate mirror asset name: {name}")
+        expected[name] = digest.lower()
+
+    _require("MIRROR-SHA256SUMS" not in expected, "mirror manifest must not include itself")
+    expected["MIRROR-SHA256SUMS"] = sha256_file(manifest_path)
+    _require(
+        len(expected) == EXPECTED_RELEASE_ASSET_COUNT,
+        f"expected exactly {EXPECTED_RELEASE_ASSET_COUNT} release assets, found {len(expected)}",
     )
-    _require(len(local_assets) == 7, f"expected exactly 7 local release assets, found {len(local_assets)}")
 
     remote_by_name: dict[str, dict] = {}
     for asset in remote_assets:
@@ -163,14 +208,11 @@ def verify_uploaded_assets(output_dir: Path, release_json_path: Path) -> None:
         _require(name not in remote_by_name, f"duplicate release asset name: {name}")
         remote_by_name[name] = asset
 
-    local_names = {path.name for path in local_assets}
-    _require(set(remote_by_name) == local_names, "uploaded release asset set does not match local verified assets")
-    for path in local_assets:
-        asset = remote_by_name[path.name]
-        _require(asset.get("state") == "uploaded", f"release asset state is not uploaded: {path.name}")
-        _require(asset.get("size") == path.stat().st_size, f"release asset size mismatch: {path.name}")
-        expected_digest = f"sha256:{sha256_file(path)}"
-        _require(asset.get("digest") == expected_digest, f"release asset digest mismatch: {path.name}")
+    _require(set(remote_by_name) == set(expected), "uploaded release asset set does not match verified manifest")
+    for name, digest in expected.items():
+        asset = remote_by_name[name]
+        _require(asset.get("state") == "uploaded", f"release asset state is not uploaded: {name}")
+        _require(asset.get("digest") == f"sha256:{digest}", f"release asset digest mismatch: {name}")
 
 
 def _metadata_from_bytes(raw: bytes) -> dict:
@@ -183,15 +225,32 @@ def _metadata_from_bytes(raw: bytes) -> dict:
     return metadata
 
 
+def _load_release(metadata_url: str) -> tuple[bytes, str, list[dict]]:
+    metadata_raw = fetch_bytes(metadata_url)
+    metadata = _metadata_from_bytes(metadata_raw)
+    version, packages = validate_release(metadata)
+    return metadata_raw, version, packages
+
+
+def _prepare_output_dir(output_dir: Path) -> Path:
+    output_dir = Path(output_dir)
+    if output_dir.exists():
+        _require(output_dir.is_dir(), "output directory path exists and is not a directory")
+        _require(not any(output_dir.iterdir()), "output directory must be empty")
+    else:
+        output_dir.mkdir(parents=True)
+    return output_dir
+
+
 def _release_notes(version: str) -> str:
     return f"""# Grafana OSS {version} — unofficial mirror
 
-This release is an independent, unofficial mirror of **unmodified** Grafana OSS Debian/Ubuntu packages downloaded from Grafana's official release infrastructure.
+This release is an independent, unofficial mirror of **unmodified** Grafana OSS packages for every platform published by the Grafana stable release API.
 
 ## Integrity and provenance
 
-- The two `.deb` files are stored with their original upstream filenames and are not modified, renamed, recompressed, or repackaged.
-- Each `.deb` is verified against the **SHA-256** published by the Grafana stable release API before this release is created.
+- All 15 package files are stored with their original upstream filenames and are not modified, renamed, recompressed, or repackaged.
+- Every package is verified against the **SHA-256** published by the Grafana stable release API before this release is published.
 - `UPSTREAM-SHA256SUMS` contains only SHA-256 values published by Grafana for the mirrored binary packages.
 - `MIRROR-SHA256SUMS` contains locally calculated hashes for all other release assets as well as the verified binaries.
 - `upstream-metadata.json` is the exact stable API response used to select this release.
@@ -212,36 +271,38 @@ The automation code in this mirror repository has its own repository license and
 """
 
 
-def prepare_release(output_dir: Path, metadata_url: str = STABLE_METADATA_URL) -> ReleaseInfo:
-    output_dir = Path(output_dir)
-    if output_dir.exists():
-        _require(output_dir.is_dir(), "output directory path exists and is not a directory")
-        _require(not any(output_dir.iterdir()), "output directory must be empty")
-    else:
-        output_dir.mkdir(parents=True)
-
-    metadata_raw = fetch_bytes(metadata_url)
-    metadata = _metadata_from_bytes(metadata_raw)
-    version, packages = validate_release(metadata)
+def prepare_package(
+    output_dir: Path,
+    package_os: str,
+    arch: str,
+    metadata_url: str = STABLE_METADATA_URL,
+) -> tuple[str, str, Path]:
+    output_dir = _prepare_output_dir(output_dir)
+    _, version, packages = _load_release(metadata_url)
+    _require((package_os, arch) in REQUIRED_PACKAGES, f"unsupported package target: {package_os}/{arch}")
+    package = next(package for package in packages if package["os"] == package_os and package["arch"] == arch)
     tag = f"grafana-oss-{version}"
 
-    assets: list[Path] = []
-    upstream_lines: list[str] = []
+    url = package["url"]
+    filename = PurePosixPath(urlparse(url).path).name
+    destination = output_dir / filename
+    download_to_path(url, destination)
+    actual = sha256_file(destination)
+    expected = package["sha256"].lower()
+    if actual != expected:
+        destination.unlink(missing_ok=True)
+        raise MirrorError(f"SHA-256 mismatch for {filename}: expected {expected}, got {actual}")
+    return version, tag, destination
 
-    for package in packages:
-        url = package["url"]
-        filename = PurePosixPath(urlparse(url).path).name
-        destination = output_dir / filename
-        download_to_path(url, destination)
-        actual = sha256_file(destination)
-        expected = package["sha256"].lower()
-        if actual != expected:
-            destination.unlink(missing_ok=True)
-            raise MirrorError(
-                f"SHA-256 mismatch for {filename}: expected {expected}, got {actual}"
-            )
-        upstream_lines.append(f"{expected}  {filename}")
-        assets.append(destination)
+
+def prepare_provenance(
+    output_dir: Path,
+    metadata_url: str = STABLE_METADATA_URL,
+) -> tuple[str, str, tuple[Path, ...], Path]:
+    output_dir = _prepare_output_dir(output_dir)
+    metadata_raw, version, packages = _load_release(metadata_url)
+    tag = f"grafana-oss-{version}"
+    assets: list[Path] = []
 
     source_path = output_dir / f"grafana-{version}-source.tar.gz"
     download_to_path(SOURCE_URL.format(version=version), source_path)
@@ -255,32 +316,38 @@ def prepare_release(output_dir: Path, metadata_url: str = STABLE_METADATA_URL) -
     metadata_path.write_bytes(metadata_raw)
     assets.append(metadata_path)
 
+    package_hashes = {
+        PurePosixPath(urlparse(package["url"]).path).name: package["sha256"].lower()
+        for package in packages
+    }
     upstream_manifest = output_dir / "UPSTREAM-SHA256SUMS"
-    upstream_manifest.write_text("\n".join(upstream_lines) + "\n", encoding="utf-8")
+    upstream_manifest.write_text(
+        "\n".join(f"{digest}  {name}" for name, digest in sorted(package_hashes.items())) + "\n",
+        encoding="utf-8",
+    )
     assets.append(upstream_manifest)
 
     mirror_manifest = output_dir / "MIRROR-SHA256SUMS"
-    mirror_lines = [f"{sha256_file(path)}  {path.name}" for path in sorted(assets, key=lambda p: p.name)]
-    mirror_manifest.write_text("\n".join(mirror_lines) + "\n", encoding="utf-8")
+    mirror_hashes = package_hashes | {path.name: sha256_file(path) for path in assets}
+    mirror_manifest.write_text(
+        "\n".join(f"{digest}  {name}" for name, digest in sorted(mirror_hashes.items())) + "\n",
+        encoding="utf-8",
+    )
     assets.append(mirror_manifest)
 
     notes_path = output_dir / "RELEASE-NOTES.md"
     notes_path.write_text(_release_notes(version), encoding="utf-8")
 
-    return ReleaseInfo(version=version, tag=tag, assets=tuple(assets), notes_path=notes_path)
+    return version, tag, tuple(assets), notes_path
 
 
-def get_release_identity(metadata_url: str = STABLE_METADATA_URL) -> tuple[str, str]:
-    metadata_raw = fetch_bytes(metadata_url)
-    metadata = _metadata_from_bytes(metadata_raw)
-    version, _ = validate_release(metadata)
-    return version, f"grafana-oss-{version}"
-
-
-def _write_github_output(path: Path, version: str, tag: str, notes: Path | None = None) -> None:
-    lines = [f"version={version}", f"tag={tag}"]
-    if notes is not None:
-        lines.append(f"notes={notes}")
+def _write_github_output(path: Path, version: str, tag: str) -> None:
+    matrix = {"include": [{"package_os": package_os, "arch": arch} for package_os, arch in REQUIRED_PACKAGES]}
+    lines = [
+        f"version={version}",
+        f"tag={tag}",
+        f"matrix={json.dumps(matrix, separators=(',', ':'))}",
+    ]
     Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -290,27 +357,46 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--metadata-url", default=STABLE_METADATA_URL)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--metadata-only", action="store_true")
+    mode.add_argument("--prepare-package", nargs=2, metavar=("OS", "ARCH"))
+    mode.add_argument("--prepare-provenance", action="store_true")
     mode.add_argument("--verify-uploaded-assets", type=Path, metavar="RELEASE_JSON")
+    parser.add_argument("--metadata-output", type=Path)
+    parser.add_argument("--mirror-manifest", type=Path)
     parser.add_argument("--github-output", type=Path)
     args = parser.parse_args(argv)
 
     if args.verify_uploaded_assets:
-        verify_uploaded_assets(args.output_dir, args.verify_uploaded_assets)
+        if not args.mirror_manifest:
+            parser.error("--verify-uploaded-assets requires --mirror-manifest")
+        verify_uploaded_assets(args.verify_uploaded_assets, args.mirror_manifest)
         print("Verified uploaded draft release assets")
         return 0
 
     if args.metadata_only:
-        version, tag = get_release_identity(args.metadata_url)
+        metadata_raw, version, _ = _load_release(args.metadata_url)
+        tag = f"grafana-oss-{version}"
+        if args.metadata_output:
+            args.metadata_output.write_bytes(metadata_raw)
         if args.github_output:
             _write_github_output(args.github_output, version, tag)
         print(f"Stable Grafana OSS: {version} ({tag})")
         return 0
 
-    info = prepare_release(args.output_dir, args.metadata_url)
-    if args.github_output:
-        _write_github_output(args.github_output, info.version, info.tag, info.notes_path)
-    print(f"Prepared Grafana OSS {info.version}: {len(info.assets)} release assets")
-    return 0
+    if args.prepare_package:
+        version, tag, asset = prepare_package(args.output_dir, *args.prepare_package, args.metadata_url)
+        if args.github_output:
+            _write_github_output(args.github_output, version, tag)
+        print(f"Prepared and verified {asset.name}")
+        return 0
+
+    if args.prepare_provenance:
+        version, tag, assets, _ = prepare_provenance(args.output_dir, args.metadata_url)
+        if args.github_output:
+            _write_github_output(args.github_output, version, tag)
+        print(f"Prepared Grafana OSS {version}: {len(assets)} provenance assets")
+        return 0
+
+    parser.error("select --metadata-only, --prepare-package, --prepare-provenance, or --verify-uploaded-assets")
 
 
 if __name__ == "__main__":
